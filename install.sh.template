@@ -1,5 +1,5 @@
 #!/bin/bash
-# no-sleep-on-the-job — installer
+# no-sleeping-on-the-job — installer
 #
 # Keeps the Mac awake while Claude Code is working, by wiring two hook
 # scripts into ~/.claude/settings.json (UserPromptSubmit/PreToolUse to
@@ -21,7 +21,7 @@ log() { printf '%s\n' "$*"; }
 die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
 
 if [ "$(uname -s)" != "Darwin" ]; then
-  die "no-sleep-on-the-job only works on macOS (it relies on caffeinate and pmset). Detected: $(uname -s)."
+  die "no-sleeping-on-the-job only works on macOS (it relies on caffeinate and pmset). Detected: $(uname -s)."
 fi
 
 command -v python3 >/dev/null 2>&1 \
@@ -144,7 +144,7 @@ with open(settings_path, "w", encoding="utf-8") as f:
     json.dump(data, f, indent=2)
     f.write("\n")
 
-print("Removed no-sleep-on-the-job hooks from settings.json" if changed else "No matching hooks found to remove.")
+print("Removed no-sleeping-on-the-job hooks from settings.json" if changed else "No matching hooks found to remove.")
 PYEOF
 }
 

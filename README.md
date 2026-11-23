@@ -1,4 +1,4 @@
-# no-sleep-on-the-job
+# no-sleeping-on-the-job
 
 Keeps your Mac awake while [Claude Code](https://claude.com/claude-code) is actually working — including background work after a turn ends — and lets it sleep again as soon as Claude is idle. If the lid is closed, the Mac still sleeps.
 
@@ -9,7 +9,7 @@ macOS only (it relies on `caffeinate` and `pmset`).
 Download [`install.sh`](install.sh) and run it:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/<you>/no-sleep-on-the-job/main/install.sh -o install.sh
+curl -fsSL https://raw.githubusercontent.com/<you>/no-sleeping-on-the-job/main/install.sh -o install.sh
 bash install.sh
 ```
 
