@@ -63,17 +63,25 @@ function Get-StartTicks($Process) {
   try { $Process.StartTime.ToUniversalTime().Ticks } catch { $null }
 }
 
-# The live process a record points to, or $null.
+# The live process a record points to, or $null. If the start time cannot be
+# read (access denied), a powershell process with that PID counts as ours:
+# calling it dead would sweep the record and leave the real holder orphaned.
 function Get-RecordProcess($Record) {
   if (-not $Record -or $Record.Id -le 4) { return $null }
   $p = Get-Process -Id $Record.Id -ErrorAction SilentlyContinue
   if (-not $p) { return $null }
-  if ((Get-StartTicks $p) -ne $Record.Ticks) { return $null }
+  $ticks = Get-StartTicks $p
+  if ($null -eq $ticks) {
+    if ($p.ProcessName -eq 'powershell') { return $p }
+    return $null
+  }
+  if ($ticks -ne $Record.Ticks) { return $null }
   $p
 }
 
+# Unreadable start time: treat as young. The holder still exits at its TTL.
 function Get-ProcessAge($Process) {
-  try { ((Get-Date) - $Process.StartTime).TotalSeconds } catch { [double]::MaxValue }
+  try { ((Get-Date) - $Process.StartTime).TotalSeconds } catch { 0 }
 }
 
 # Readers hold the file only for a moment; retry instead of losing the record.
@@ -124,25 +132,45 @@ function Remove-StaleRecords {
   }
 }
 
+# Kills the session's Stop watcher. Call it with the session lock held, so the
+# watcher cannot be inside its own locked release when it dies.
+function Stop-SessionWatcher([string]$SessionId, [string]$Kind, [string]$HookEvent) {
+  $watchFile = Join-Path $NoSleepDir "$SessionId.watch"
+  if (-not (Test-Path -LiteralPath $watchFile)) { return }
+  $w = Get-RecordProcess (Read-ProcRecord $watchFile)
+  if ($w) {
+    Stop-Process -Id $w.Id -Force
+    [void]$w.WaitForExit(2000)
+    Write-HookLog $Kind $HookEvent $SessionId "stopped watcher pid=$($w.Id)"
+  }
+  Remove-Item -LiteralPath $watchFile -Force
+}
+
 # Start a holder for the session, or refresh it once it is older than REFRESH.
+# UserPromptSubmit also stops the previous Stop's watcher (waiting for the lock
+# if that watcher is mid-release), so it cannot release this new turn's holder.
 function Invoke-Acquire([string]$SessionId, [string]$HookEvent) {
   $refresh = Get-EnvInt 'CLAUDE_SLEEP_HOOK_REFRESH' 1800
   $ttl = Get-EnvInt 'CLAUDE_SLEEP_HOOK_TTL' 3600
   $pidFile = Join-Path $NoSleepDir "$SessionId.pid"
+  $newTurn = ($HookEvent -eq 'UserPromptSubmit') -and (Test-Path -LiteralPath (Join-Path $NoSleepDir "$SessionId.watch"))
 
   $old = Get-RecordProcess (Read-ProcRecord $pidFile)
-  if ($old -and (Get-ProcessAge $old) -lt $refresh) {
+  if (-not $newTurn -and $old -and (Get-ProcessAge $old) -lt $refresh) {
     if ($HookEvent -ne 'Watcher') { Write-HookLog 'acquire' $HookEvent $SessionId "held pid=$($old.Id)" }
     return
   }
 
   [void](New-Item -ItemType Directory -Path $NoSleepDir -Force)
-  $lock = Enter-SessionLock $SessionId 0
+  $wait = 0
+  if ($newTurn) { $wait = 3000 }
+  $lock = Enter-SessionLock $SessionId $wait
   if (-not $lock) {
     Write-HookLog 'acquire' $HookEvent $SessionId 'lock-busy'
     return
   }
   try {
+    if ($newTurn) { Stop-SessionWatcher $SessionId 'acquire' $HookEvent }
     # Re-check under the lock: a parallel call may have just started it.
     $old = Get-RecordProcess (Read-ProcRecord $pidFile)
     if ($old -and (Get-ProcessAge $old) -lt $refresh) { return }

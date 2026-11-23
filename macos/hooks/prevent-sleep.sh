@@ -11,6 +11,7 @@
 #   crashes without Stop/SessionEnd therefore keeps the Mac awake at most TTL.
 # - allow-sleep.sh's Stop watcher calls this hook with event "Watcher" on every
 #   poll to keep the lock alive; "held" is not logged for those calls.
+# - UserPromptSubmit stops that watcher first: a new turn owns the lock again.
 # - Never prints anything, never blocks, always exits 0.
 
 exec 2>/dev/null
@@ -73,6 +74,24 @@ EOF
   if [ -n "$c" ]; then h=$a; m=$b; s=$c; else m=$a; s=$b; fi
   echo $(( 10#$days * 86400 + 10#$h * 3600 + 10#$m * 60 + 10#$s ))
 }
+
+# ---- new turn: stop the previous Stop's watcher ----------------------------
+# Otherwise it could release the lock moments after this turn found it held.
+WATCH_FILE="$DIR/$sid.watch"
+if [ "$event" = UserPromptSubmit ] && [ -f "$WATCH_FILE" ]; then
+  wpid=
+  read -r wpid <"$WATCH_FILE"
+  if is_pid "$wpid" && [[ $(/bin/ps -ww -p "$wpid" -o args=) == *" --watch $sid" ]]; then
+    kill "$wpid"
+    # It finishes its current command before the TERM trap fires (<0.5 s).
+    for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25; do
+      kill -0 "$wpid" || break
+      /bin/sleep 0.02
+    done
+    log "stopped watcher pid=$wpid"
+  fi
+  /bin/rm -f "$WATCH_FILE"
+fi
 
 # ---- fast path -------------------------------------------------------------
 old_pid=

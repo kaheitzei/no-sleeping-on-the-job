@@ -3,14 +3,14 @@
 #
 # - SessionEnd (or any event other than Stop): kill this session's watcher,
 #   then the holder, under the session lock.
-# - Stop: do not release right away. Start one hidden watcher
-#   (`allow-sleep.ps1 -Watch -SessionId <id>`) and return. The watcher keeps
-#   the holder alive while the Claude desktop app holds a power request, and
-#   releases once it is gone. If there is no request at the first check it
-#   releases at once.
-#   The app's request is read from `powercfg /requests`, which needs an
-#   elevated (administrator) process; unelevated, the first check finds
-#   nothing and Stop releases at once.
+# - Stop: if the Claude desktop app's power request can be seen, start one
+#   hidden watcher (`allow-sleep.ps1 -Watch -SessionId <id>`) and return. The
+#   watcher keeps the holder alive while the app holds that request, and
+#   releases once it is gone (or right away if it is absent at the first
+#   check). The next UserPromptSubmit stops the watcher.
+#   The request is read from `powercfg /requests`, which needs an elevated
+#   (administrator) process. Unelevated, nothing can be seen, so Stop
+#   releases at once without starting a watcher.
 # - `allow-sleep.ps1 -Signal` runs the signal check alone: exit 0 and print the
 #   matched line when work is running, exit 1 otherwise.
 # - The hook never prints anything, never blocks, always exits 0.
@@ -23,7 +23,20 @@ param([switch]$Watch, [switch]$Signal, [string]$SessionId)
 $ErrorActionPreference = 'SilentlyContinue'
 $SelfPath = $PSCommandPath
 
+# The desktop app's main process: MSIX (WindowsApps\Claude_*\app) or the older
+# per-user install (AnthropicClaude\app-*). The Claude Code CLI is also named
+# claude.exe but lives elsewhere, so it never matches.
+$AppPathRe = '\\(WindowsApps\\Claude_[^\\]+\\app|AnthropicClaude\\app-[^\\]+)\\claude\.exe\s*$'
+
+function Test-CanSeeSignal {
+  if ($env:CLAUDE_SLEEP_HOOK_SIGNAL_CMD) { return $true }
+  $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+  (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
 # Returns the matched line while the Claude app says work is running, else $null.
+# Only SYSTEM/EXECUTION requests count: DISPLAY requests come from video
+# playback in the app, not from Claude working.
 function Find-WorkSignal {
   $cmd = $env:CLAUDE_SLEEP_HOOK_SIGNAL_CMD
   if ($cmd) {
@@ -36,16 +49,20 @@ function Find-WorkSignal {
   $section = ''
   foreach ($line in $out) {
     if ($line -match '^([A-Z]+):\s*$') { $section = $Matches[1]; continue }
-    if ($section -in @('DISPLAY', 'SYSTEM', 'EXECUTION', 'AWAYMODE') -and
-        $line -match '^\[PROCESS\]\s.*\\claude\.exe\s*$') {
+    if ($section -in @('SYSTEM', 'EXECUTION') -and $line -match '^\[PROCESS\]\s' -and $line -match $AppPathRe) {
       return $line.Trim()
     }
   }
   $null
 }
 
+# If the lock is busy, a new turn or SessionEnd is handling the session: leave it.
 function Invoke-LockedRelease([string]$SessionId, [string]$HookEvent, [string]$Reason) {
   $lock = Enter-SessionLock $SessionId 2000
+  if (-not $lock) {
+    Write-HookLog 'release' $HookEvent $SessionId "skipped, session busy $Reason"
+    return
+  }
   try { Invoke-Release $SessionId $HookEvent $Reason } finally { Exit-SessionLock $lock }
 }
 
@@ -100,6 +117,10 @@ function Invoke-StopHook([string]$SessionId) {
     Write-HookLog 'release' 'Stop' $SessionId 'nothing-held'
     return
   }
+  if (-not (Test-CanSeeSignal)) {
+    Invoke-LockedRelease $SessionId 'Stop' 'reason=unelevated'
+    return
+  }
   $w = Get-RecordProcess (Read-ProcRecord $watchFile)
   if ($w) {
     Write-HookLog 'release' 'Stop' $SessionId "watcher already running pid=$($w.Id)"
@@ -117,15 +138,9 @@ function Invoke-StopHook([string]$SessionId) {
 # Holding the lock while killing the watcher means it cannot be halfway
 # through starting a holder that would outlive this release.
 function Invoke-EndHook([string]$SessionId, [string]$HookEvent) {
-  $watchFile = Join-Path $NoSleepDir "$SessionId.watch"
   $lock = Enter-SessionLock $SessionId 3000
   try {
-    $w = Get-RecordProcess (Read-ProcRecord $watchFile)
-    if ($w) {
-      Stop-Process -Id $w.Id -Force
-      Write-HookLog 'release' $HookEvent $SessionId "killed watcher pid=$($w.Id)"
-    }
-    Remove-Item -LiteralPath $watchFile -Force
+    Stop-SessionWatcher $SessionId 'release' $HookEvent
     Invoke-Release $SessionId $HookEvent ''
   } finally {
     Exit-SessionLock $lock

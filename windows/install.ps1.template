@@ -23,6 +23,7 @@ function Get-NoSleepConfig {
   [pscustomobject]@{
     HooksDir = $hooksDir
     Settings = Join-Path $env:USERPROFILE '.claude\settings.json'
+    StateDir = Join-Path $env:TEMP 'claude_awake'
     Files    = [ordered]@{
       'common.ps1'        = '__COMMON_B64__'
       'keep-awake.ps1'    = '__KEEP_AWAKE_B64__'
@@ -45,28 +46,168 @@ function Get-NoSleepHookCommand($Config, [string]$ScriptName) {
   'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}"' -f $path
 }
 
-function Read-NoSleepSettings([string]$Path) {
-  if (-not (Test-Path -LiteralPath $Path)) { return $null }
-  $raw = [IO.File]::ReadAllText($Path)
-  if (-not $raw.Trim()) { return [pscustomobject]@{} }
-  $raw | ConvertFrom-Json
+function Test-NoSleepIsObject($Value) {
+  $null -ne $Value -and $Value.GetType().FullName -eq 'System.Management.Automation.PSCustomObject'
 }
 
-function Write-NoSleepSettings([string]$Path, $Data) {
-  $json = ConvertTo-Json -InputObject $Data -Depth 100
-  [IO.File]::WriteAllText($Path, $json + "`n", (New-Object System.Text.UTF8Encoding($false)))
+# ---- JSON writer -----------------------------------------------------------
+# PS 5.1's ConvertTo-Json re-indents everything oddly and escapes ' < > &.
+# This writes plain 2-space JSON and leaves non-ASCII text as it is.
+
+function ConvertTo-NoSleepJsonString([string]$Text) {
+  $sb = New-Object System.Text.StringBuilder
+  [void]$sb.Append('"')
+  foreach ($ch in $Text.ToCharArray()) {
+    $code = [int]$ch
+    if ($code -eq 34) { [void]$sb.Append('\"') }
+    elseif ($code -eq 92) { [void]$sb.Append('\\') }
+    elseif ($code -eq 10) { [void]$sb.Append('\n') }
+    elseif ($code -eq 13) { [void]$sb.Append('\r') }
+    elseif ($code -eq 9) { [void]$sb.Append('\t') }
+    elseif ($code -lt 32) { [void]$sb.Append(('\u{0:x4}' -f $code)) }
+    else { [void]$sb.Append($ch) }
+  }
+  [void]$sb.Append('"')
+  $sb.ToString()
+}
+
+function ConvertTo-NoSleepJson($Value, [string]$Indent = '') {
+  $inv = [Globalization.CultureInfo]::InvariantCulture
+  if ($null -eq $Value) { return 'null' }
+  if ($Value -is [string]) { return ConvertTo-NoSleepJsonString $Value }
+  if ($Value -is [bool]) { if ($Value) { return 'true' } else { return 'false' } }
+  if ($Value -is [double] -or $Value -is [single]) { return ([double]$Value).ToString('R', $inv) }
+  if ($Value -is [int] -or $Value -is [long] -or $Value -is [decimal] -or $Value -is [int16] -or
+      $Value -is [byte] -or $Value -is [uint32] -or $Value -is [uint64]) {
+    return ([IFormattable]$Value).ToString($null, $inv)
+  }
+  $inner = $Indent + '  '
+  if (Test-NoSleepIsObject $Value) {
+    $props = @($Value.PSObject.Properties)
+    if ($props.Count -eq 0) { return '{}' }
+    $parts = foreach ($p in $props) { $inner + (ConvertTo-NoSleepJsonString $p.Name) + ': ' + (ConvertTo-NoSleepJson $p.Value $inner) }
+    return "{`n" + ($parts -join ",`n") + "`n$Indent}"
+  }
+  if ($Value -is [System.Collections.IEnumerable]) {
+    $items = @($Value)
+    if ($items.Count -eq 0) { return '[]' }
+    $parts = foreach ($i in $items) { $inner + (ConvertTo-NoSleepJson $i $inner) }
+    return "[`n" + ($parts -join ",`n") + "`n$Indent]"
+  }
+  ConvertTo-NoSleepJsonString ([string]$Value)
+}
+
+# ---- settings.json ---------------------------------------------------------
+
+# Returns @{ Exists; Data }. Throws (before anything is changed) if the file
+# is not valid JSON or does not have the shape Claude Code expects.
+function Read-NoSleepSettings([string]$Path) {
+  if (-not (Test-Path -LiteralPath $Path)) { return @{ Exists = $false; Data = [pscustomobject]@{} } }
+  $raw = [IO.File]::ReadAllText($Path)
+  if (-not $raw.Trim()) { return @{ Exists = $true; Data = [pscustomobject]@{} } }
+  try {
+    $data = $raw | ConvertFrom-Json
+  } catch {
+    throw "$Path is not valid JSON ($($_.Exception.Message)). Fix it and re-run; nothing was changed."
+  }
+  if (-not (Test-NoSleepIsObject $data)) { throw "${Path}: the top level is not a JSON object. Nothing was changed." }
+  $hooksProp = $data.PSObject.Properties['hooks']
+  if ($hooksProp -and $null -ne $hooksProp.Value) {
+    if (-not (Test-NoSleepIsObject $hooksProp.Value)) { throw "${Path}: `"hooks`" is not an object. Nothing was changed." }
+    foreach ($p in $hooksProp.Value.PSObject.Properties) {
+      if ($null -ne $p.Value -and -not ($p.Value -is [array])) {
+        throw "${Path}: `"hooks.$($p.Name)`" is not a list. Nothing was changed."
+      }
+    }
+  }
+  @{ Exists = $true; Data = $data }
+}
+
+# The comma keeps PowerShell from unrolling the array on return.
+function Get-NoSleepEntryHooks($Entry) {
+  if (-not (Test-NoSleepIsObject $Entry)) { return $null }
+  $p = $Entry.PSObject.Properties['hooks']
+  if (-not $p -or -not ($p.Value -is [array])) { return $null }
+  , $p.Value
+}
+
+function Test-NoSleepIsOurs($Hook, $Commands) {
+  (Test-NoSleepIsObject $Hook) -and $Hook.PSObject.Properties['command'] -and ($Commands -contains $Hook.command)
 }
 
 function Backup-NoSleepSettings([string]$Path) {
-  $stamp = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
-  $backup = "$Path.bak-$stamp"
-  Copy-Item -LiteralPath $Path -Destination $backup
-  Write-Host "Backed up existing settings to $backup"
+  $base = '{0}.bak-{1}' -f $Path, [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+  $dest = $base
+  $n = 1
+  while (Test-Path -LiteralPath $dest) { $dest = "$base-$n"; $n++ }
+  Copy-Item -LiteralPath $Path -Destination $dest
+  Write-Host "Backed up existing settings to $dest"
 }
+
+# Temp file + replace, so a crash never leaves a cut-off settings.json. A
+# symlinked/junctioned file is written in place to keep the link.
+function Write-NoSleepSettings([string]$Path, $Data) {
+  $text = (ConvertTo-NoSleepJson $Data) + "`n"
+  $utf8 = New-Object System.Text.UTF8Encoding($false)
+  [void](New-Item -ItemType Directory -Path (Split-Path -Parent $Path) -Force)
+  $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+  if ($item -and ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+    [IO.File]::WriteAllText($Path, $text, $utf8)
+    return
+  }
+  $tmp = "$Path.tmp-$PID"
+  try {
+    [IO.File]::WriteAllText($tmp, $text, $utf8)
+    if ($item) {
+      # [NullString]: a plain $null reaches .NET as "" and Replace rejects it.
+      [IO.File]::Replace($tmp, $Path, [NullString]::Value)
+    } else {
+      [IO.File]::Move($tmp, $Path)
+    }
+  } finally {
+    if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force }
+  }
+}
+
+# ---- running processes -----------------------------------------------------
+
+# Kills watchers first (so none re-acquires), then holders. A record only
+# counts while the process with that PID also has the recorded start time.
+function Stop-NoSleepProcesses($Config) {
+  if (-not (Test-Path -LiteralPath $Config.StateDir)) { return }
+  $n = 0
+  foreach ($ext in '.watch', '.pid') {
+    foreach ($f in @(Get-ChildItem -LiteralPath $Config.StateDir -File -Filter "*$ext" -ErrorAction SilentlyContinue)) {
+      $parts = @(([IO.File]::ReadAllText($f.FullName)).Trim() -split '\s+')
+      $id = 0
+      $ticks = [long]0
+      if ($parts.Count -eq 2 -and [int]::TryParse($parts[0], [ref]$id) -and [long]::TryParse($parts[1], [ref]$ticks) -and $id -gt 4) {
+        $p = Get-Process -Id $id -ErrorAction SilentlyContinue
+        $start = $null
+        if ($p) { try { $start = $p.StartTime.ToUniversalTime().Ticks } catch {} }
+        if ($p -and $p.ProcessName -eq 'powershell' -and ($null -eq $start -or $start -eq $ticks)) {
+          Stop-Process -Id $id -Force -ErrorAction SilentlyContinue
+          [void]$p.WaitForExit(2000)
+          $n++
+        }
+      }
+      Remove-Item -LiteralPath $f.FullName -Force -ErrorAction SilentlyContinue
+    }
+  }
+  Write-Host "Stopped $n running keep-awake process(es)"
+}
+
+# ---- install / uninstall ---------------------------------------------------
 
 function Install-NoSleep {
   $ErrorActionPreference = 'Stop'
   $cfg = Get-NoSleepConfig
+  $settings = Read-NoSleepSettings $cfg.Settings
+  $data = $settings.Data
+
+  if ($ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage') {
+    Write-Warning ('PowerShell runs in {0} here (AppLocker/WDAC policy). keep-awake.ps1 needs FullLanguage to call SetThreadExecutionState, so the hooks will not keep this PC awake.' -f $ExecutionContext.SessionState.LanguageMode)
+  }
 
   [void](New-Item -ItemType Directory -Path $cfg.HooksDir -Force)
   foreach ($name in $cfg.Files.Keys) {
@@ -74,27 +215,27 @@ function Install-NoSleep {
   }
   Write-Host "Installed hook scripts to $($cfg.HooksDir)"
 
-  $data = Read-NoSleepSettings $cfg.Settings
-  if ($null -eq $data) {
-    $data = [pscustomobject]@{}
-  } else {
-    Backup-NoSleepSettings $cfg.Settings
-  }
+  $hooksProp = $data.PSObject.Properties['hooks']
+  $hooks = $null
+  if ($hooksProp) { $hooks = $hooksProp.Value }
+  if ($null -eq $hooks) { $hooks = [pscustomobject]@{} }
 
-  if (-not $data.PSObject.Properties['hooks']) {
-    $data | Add-Member -NotePropertyName 'hooks' -NotePropertyValue ([pscustomobject]@{})
-  }
-  $hooks = $data.hooks
-
-  $added = $false
+  $added = @()
   foreach ($hookEvent in $cfg.Events.Keys) {
     $command = Get-NoSleepHookCommand $cfg $cfg.Events[$hookEvent]
     $prop = $hooks.PSObject.Properties[$hookEvent]
     $entries = @()
-    if ($prop) { $entries = @($prop.Value | Where-Object { $null -ne $_ }) }
+    if ($prop -and $null -ne $prop.Value) { $entries = @($prop.Value) }
 
-    $already = @($entries | Where-Object { @($_.hooks | Where-Object { $_.command -eq $command }).Count -gt 0 })
-    if ($already.Count -gt 0) { continue }
+    $present = $false
+    foreach ($e in $entries) {
+      $hs = Get-NoSleepEntryHooks $e
+      if ($null -eq $hs) { continue }
+      foreach ($h in $hs) {
+        if (Test-NoSleepIsOurs $h @($command)) { $present = $true }
+      }
+    }
+    if ($present) { continue }
 
     $entries += [pscustomobject]@{
       hooks = @([pscustomobject]@{ type = 'command'; command = $command; timeout = 10 })
@@ -104,14 +245,20 @@ function Install-NoSleep {
     } else {
       $hooks | Add-Member -NotePropertyName $hookEvent -NotePropertyValue $entries
     }
-    $added = $true
+    $added += $hookEvent
   }
 
-  Write-NoSleepSettings $cfg.Settings $data
-  if ($added) {
-    Write-Host 'Hooks wired up in settings.json'
+  if ($added.Count -eq 0) {
+    Write-Host 'Hooks already present in settings.json, nothing to change'
   } else {
-    Write-Host 'Hooks already present in settings.json, nothing to add'
+    if ($hooksProp) {
+      $hooksProp.Value = $hooks
+    } else {
+      $data | Add-Member -NotePropertyName 'hooks' -NotePropertyValue $hooks
+    }
+    if ($settings.Exists) { Backup-NoSleepSettings $cfg.Settings }
+    Write-NoSleepSettings $cfg.Settings $data
+    Write-Host ('Hooks wired up in settings.json ({0})' -f ($added -join ', '))
   }
   Write-Host ''
   Write-Host 'Done. Start a new Claude Code session to pick up the hooks.'
@@ -124,47 +271,49 @@ function Uninstall-NoSleep {
   $ErrorActionPreference = 'Stop'
   $cfg = Get-NoSleepConfig
   $commands = @($cfg.Events.Values | Select-Object -Unique | ForEach-Object { Get-NoSleepHookCommand $cfg $_ })
+  $settings = Read-NoSleepSettings $cfg.Settings
+  $data = $settings.Data
+  $hooksProp = $data.PSObject.Properties['hooks']
 
-  $data = Read-NoSleepSettings $cfg.Settings
-  if ($null -eq $data) {
+  if (-not $settings.Exists) {
     Write-Host 'No settings.json found, nothing to clean up.'
-  } elseif (-not $data.PSObject.Properties['hooks'] -or $null -eq $data.hooks) {
+  } elseif (-not $hooksProp -or $null -eq $hooksProp.Value) {
     Write-Host 'No hooks block found, nothing to clean up.'
   } else {
-    Backup-NoSleepSettings $cfg.Settings
-    $hooks = $data.hooks
+    $hooks = $hooksProp.Value
     $changed = $false
     foreach ($prop in @($hooks.PSObject.Properties)) {
+      if ($null -eq $prop.Value) { continue }
       $kept = @()
-      foreach ($entry in @($prop.Value | Where-Object { $null -ne $_ })) {
-        $original = @($entry.hooks | Where-Object { $null -ne $_ })
-        $filtered = @($original | Where-Object { $commands -notcontains $_.command })
-        if ($filtered.Count -ne $original.Count) { $changed = $true }
+      $removed = $false
+      foreach ($entry in @($prop.Value)) {
+        $hs = Get-NoSleepEntryHooks $entry
+        if ($null -eq $hs) { $kept += , $entry; continue }
+        $filtered = @($hs | Where-Object { -not (Test-NoSleepIsOurs $_ $commands) })
+        if ($filtered.Count -eq @($hs).Count) { $kept += , $entry; continue }
+        $removed = $true
         if ($filtered.Count -gt 0) {
           $entry.hooks = $filtered
-          $kept += $entry
-        } elseif ($original.Count -eq 0) {
-          $kept += $entry
+          $kept += , $entry
         }
         # else: every hook in this entry was ours -> drop the whole entry
       }
-      if ($kept.Count -gt 0) {
-        $prop.Value = $kept
-      } else {
-        $hooks.PSObject.Properties.Remove($prop.Name)
+      if ($removed) {
+        $changed = $true
+        if ($kept.Count -gt 0) { $prop.Value = $kept } else { $hooks.PSObject.Properties.Remove($prop.Name) }
       }
     }
-    if (@($hooks.PSObject.Properties).Count -eq 0) {
-      $data.PSObject.Properties.Remove('hooks')
-    }
-    Write-NoSleepSettings $cfg.Settings $data
     if ($changed) {
+      if (@($hooks.PSObject.Properties).Count -eq 0) { $data.PSObject.Properties.Remove('hooks') }
+      Backup-NoSleepSettings $cfg.Settings
+      Write-NoSleepSettings $cfg.Settings $data
       Write-Host 'Removed no-sleeping-on-the-job hooks from settings.json'
     } else {
       Write-Host 'No matching hooks found to remove.'
     }
   }
 
+  Stop-NoSleepProcesses $cfg
   foreach ($name in $cfg.Files.Keys) {
     Remove-Item -LiteralPath (Join-Path $cfg.HooksDir $name) -Force -ErrorAction SilentlyContinue
   }
