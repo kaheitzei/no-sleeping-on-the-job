@@ -9,7 +9,7 @@ macOS only (it relies on `caffeinate` and `pmset`).
 Download [`install.sh`](install.sh) and run it:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/<you>/no-sleeping-on-the-job/main/install.sh -o install.sh
+curl -fsSL https://raw.githubusercontent.com/kaheitzei/no-sleeping-on-the-job/master/install.sh -o install.sh
 bash install.sh
 ```
 
